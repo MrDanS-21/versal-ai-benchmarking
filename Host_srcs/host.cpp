@@ -8,9 +8,9 @@
 #include <cstring> 
 #include <iostream> 
 #include <fstream>
-#include "input_data.h"
-#include "input1_data.h"
-#include "golden_data.h"
+#include "../data/inputA_data.h"
+#include "../data/inputB_data.h"
+#include "../data/goldenC_data.h"
 
 #define DATA_SIZE_IN0 16
 #define DATA_SIZE_IN1 4
@@ -32,14 +32,14 @@ int main(int argc, char** argv)
 	int sizePLIn0  = DATA_SIZE_IN0;
 	int* DataInput0 = new int[sizePLIn0];
 	for(int i=0;i<sizePLIn0;i++){
-	DataInput0[i]= input_data[i];
+	DataInput0[i]= inputA_data[i];
 		printf("DataInput0[%d]=%d\n", i,DataInput0[i]);
 	}
 
 	int sizePLIn1  = DATA_SIZE_IN1;
 	int* DataInput1 = new int[sizePLIn1];
 	for(int i=0;i<sizePLIn1;i++){
-	DataInput1[i]= input1_data[i];
+	DataInput1[i]= inputB_data[i];
 		printf("DataInput1[%d]=%d\n", i,DataInput1[i]);
 	}
 
@@ -47,7 +47,7 @@ int main(int argc, char** argv)
 	int* goldenPL0     = new int[sizePLOut0];
 
 	for(int i=0;i<sizePLOut0;i++){
-        goldenPL0[i]=golden_data[i] ;
+        goldenPL0[i]=goldenC_data[i] ;
 		printf("goldenPL0[%d]=%d\n", i,goldenPL0[i]);
 	}
 

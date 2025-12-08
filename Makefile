@@ -1,10 +1,16 @@
 #Copyright (C) 2023, Advanced Micro Devices, Inc. All rights reserved.
 #SPDX-License-Identifier: MIT
 
+.PHONY: all data aie hls host vitis run_hw_emu clean
 
 vitis := ./vitis_dir/a.xclbin
 
-all: aie hls host vitis
+all: data aie hls host vitis
+
+
+# Generate the pseudo-random input matrices and expected output matrix.
+data:
+	make all -C data
 
 
 # The below command will do cd to AIE_Kernel directory and run the makefile available in AIE_Kernel directory
@@ -34,6 +40,7 @@ run_hw_emu: all
 	make run -C vitis_dir
 
 clean:
+	make clean -C data
 	make clean -C AIE_Kernel
 	make clean -C HLS_Kernels
 	make clean -C Host_srcs

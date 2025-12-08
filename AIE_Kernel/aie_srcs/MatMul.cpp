@@ -12,10 +12,7 @@ SPDX-License-Identifier: MIT
 void MatMul( adf::input_buffer<int32> & __restrict in1, adf::input_buffer<int32> & __restrict in2,
              adf::output_buffer<int32> & __restrict out_put)
 {
- // A(4x4) x B(4x1)= c(4x1)
-        constexpr unsigned M=4 ,N=4 , k=1 ;
-
-        using MMUL = aie::mmul <M,N,k, int32,int32> ;
+        using MMUL = aie::mmul <MAT_M, MAT_K, MAT_N, int32,int32> ;
         const int32* __restrict  pA=(int32*) in1.data();
         const int32* __restrict pB=(int32*) in2.data();
         int32* __restrict pC =out_put.data();

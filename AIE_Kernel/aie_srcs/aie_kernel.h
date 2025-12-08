@@ -7,8 +7,7 @@ SPDX-License-Identifier: MIT
 #define __AIE_KERNELS_H__
 
 #include <adf.h>
-
-#define NUM_SAMPLES 8
+#include "../../include/matmul_config.h"
 
 void MatMul( adf::input_buffer<int32> & __restrict in1, adf::input_buffer<int32> & __restrict in2,
              adf::output_buffer<int32> & __restrict out_put)  ;
