@@ -46,3 +46,5 @@ clean:
 	rm xcd.log
 	rm vpp_link.log
 	rm vivado.*
+	rm ./analyzer_input -rf
+	rm ./.ipcache -rf
