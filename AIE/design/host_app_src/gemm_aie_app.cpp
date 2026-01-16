@@ -1,0 +1,386 @@
+/*
+Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+SPDX-License-Identifier: MIT
+*/
+
+#include "graph.cpp"
+
+#include <cstdio>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <chrono>
+
+#include "adf/adf_api/XRTConfig.h"
+
+#include "xrt/xrt_aie.h"
+#include "xrt/xrt_kernel.h"
+#include "xrt/xrt_bo.h"
+
+//#define DEBUG_PRINT
+
+#ifdef DEBUG_PRINT
+#define DPRINTF(...) printf(__VA_ARGS__)
+#else
+#define DPRINTF(...) ((void)0)
+#endif
+
+#define OPTIMIZED_OVERLAY 1
+
+#if OPTIMIZED_OVERLAY
+
+// HLS Datamover Loops and Graph will run Infinitely...
+#if ITER_CNT == -1
+   #define MATA_SZ -1 
+   #define MATB_SZ -1
+   #define MATC_SZ -1
+
+#else
+     #define MATA_SZ (((GEMM_SIZE_ZP_A) * GEMM_SIZE / CASC_LN) / 8) * ITER_CNT * ((GEMM_SIZE_ZP_B/SPLIT) / DIM_B)
+     #define MATB_SZ (((GEMM_SIZE * GEMM_SIZE_ZP_B ) / (CASC_LN*SPLIT) ) / 8) * ITER_CNT * (GEMM_SIZE_ZP_A / DIM_A) 
+     #define MATC_SZ (((GEMM_SIZE_ZP_A * GEMM_SIZE_ZP_B ) / SPLIT ) / 8) * ITER_CNT
+#endif
+
+#endif
+
+namespace {
+using clock = std::chrono::steady_clock;
+
+inline double ms(clock::duration d)
+{
+  return std::chrono::duration<double, std::milli>(d).count();
+}
+}
+
+using namespace std;
+
+static std::vector<char>
+load_xclbin(xrtDeviceHandle device, const std::string& fnm)
+{
+   if (fnm.empty())
+      throw std::runtime_error("No xclbin speified");
+
+   // load bit stream
+   std::ifstream stream(fnm);
+   stream.seekg(0,stream.end);
+   size_t size = stream.tellg();
+   stream.seekg(0,stream.beg);
+
+   std::vector<char> header(size);
+   stream.read(header.data(),size);
+
+   auto top = reinterpret_cast<const axlf*>(header.data());
+   if (xrtDeviceLoadXclbin(device, top))
+      throw std::runtime_error("Bitstream download failed");
+
+   return header;
+}
+
+class datamover
+{
+   public:
+   xrtKernelHandle dma_hls_khdl;
+   xrtRunHandle dma_hls_rhdl;
+   uint32_t instance_errCnt;
+
+   void init(xrtDeviceHandle dhdl, const axlf *top, char insts)
+   {
+      std::string dma_hls_obj_str = "dma_hls:{dma_hls_" + to_string(insts) + "}";
+      const char *dma_hls_obj = dma_hls_obj_str.c_str();
+
+      //////////////////////////////////////////
+      // Data Mover IP Init
+      //////////////////////////////////////////
+
+      // Open kernel handle exclusively to read the ap_return register later for reporting error...
+      dma_hls_khdl = xrtPLKernelOpenExclusive(dhdl, top->m_header.uuid, dma_hls_obj);
+      dma_hls_rhdl = xrtRunOpen(dma_hls_khdl);
+
+      int rval = xrtRunSetArg(dma_hls_rhdl, 35, MATA_SZ);
+          rval = xrtRunSetArg(dma_hls_rhdl, 36, MATB_SZ);
+          rval = xrtRunSetArg(dma_hls_rhdl, 37, MATC_SZ);
+          //rval = xrtRunSetArg(dma_hls_rhdl, 47, ITER_CNT);
+      
+      DPRINTF("Initialised dma_hls...\n");
+   }
+
+   void run(void)
+   {
+      xrtRunStart(dma_hls_rhdl);
+      DPRINTF("dma_hls is running...\n");
+   }
+
+   void waitTo_complete(void)
+   {
+      auto state = xrtRunWait(dma_hls_rhdl);
+      DPRINTF("dma_hls Kernel completed with status(%d)\n", state);
+   }
+
+   void golden_check(uint32_t *errCnt, char insts)
+   {
+      //////////////////////////////////////////
+      // Compare results
+      //////////////////////////////////////////
+
+      // Reading the error count for the ap_return reg of the hls kernel...
+      xrtKernelReadRegister(dma_hls_khdl, 0x10, &instance_errCnt);
+      
+      //std::cout << "gemm_" << insts << std::endl;
+      DPRINTF("gemm_%d ", insts);
+      std::cout << (instance_errCnt ? "Failed! " : "Passed! ") << "With error count " << instance_errCnt << ".\n" << std::endl;
+
+      // Adding instance error to the total error count...
+      *errCnt += instance_errCnt;
+   }
+
+   void close(void)
+   {
+      xrtRunClose(dma_hls_rhdl);
+      DPRINTF("Closed dma_hls kernel run handle...\n");
+
+      xrtKernelClose(dma_hls_khdl);
+      DPRINTF("Closed dma_hls kernel handle...\n");
+   }
+};
+
+class gemm_graph
+{
+   public:
+   xrtGraphHandle gemm_aie_gr;
+
+   int init(xrtDeviceHandle dhdl, const axlf *top, char insts)
+   {
+      //////////////////////////////////////////
+      // GEMM Graph Init for AIE
+      //////////////////////////////////////////
+      
+      std::string gemm_aie_obj_str = "g";
+
+      const char *gemm_aie_obj = gemm_aie_obj_str.c_str();
+
+      int init_st = 0;
+
+      gemm_aie_gr = xrtGraphOpen(dhdl, top->m_header.uuid, gemm_aie_obj);
+      if (!gemm_aie_gr) {
+         throw std::runtime_error("Unable to open GEMM g graph handle");
+	      init_st = 1;
+      }
+      else
+      {
+         DPRINTF("GEMM graph g Initialised...\n");
+      }
+
+      return init_st;
+   }
+
+   int run(void)
+   {
+      //////////////////////////////////////////
+      // GEMM Graph Run for AIE
+      //////////////////////////////////////////
+      
+      int init_st = 0;
+
+      int ret = xrtGraphReset(gemm_aie_gr);
+      ret = xrtGraphRun(gemm_aie_gr, GRAPH_ITER_CNT);
+      if (ret) {
+         throw std::runtime_error("Unable to run GEMM g graph");
+         init_st = 1;
+      }
+      else
+      {
+         DPRINTF("GEMM graph g running...\n");
+      }
+     
+      return init_st;
+   }
+
+   void close(void)
+   {
+      //////////////////////////////////////////
+      // GEMM Graph End for AIE
+      //////////////////////////////////////////
+       
+      xrtGraphClose(gemm_aie_gr);
+      DPRINTF("GEMM graph g end...\n");
+
+   }
+};
+
+int main(int argc, char ** argv)
+{
+   //////////////////////////////////////////
+   // Open xclbin
+   //////////////////////////////////////////
+
+   if(argc < 2) {
+      std::cout << "Usage: " << argv[0] <<" <xclbin>" << std::endl;
+      return EXIT_FAILURE;
+   }
+
+   else {
+      //Init timing
+      double linux_e2e_ms     = -1.0;
+      double linux_compute_ms = -1.0;
+
+      //If argc is 2 it loads xclbin(Normal Flow)
+      //If argc is 3 and argv[2] is LOAD_XCLBIN ,it loads xclbin(To get POWER values)
+      if(argc==2 || (argc==3 && strcmp(argv[2],"LOAD_XCLBIN")==0)) {
+
+         const char* xclbinFilename = argv[1];
+         auto dhdl = xrtDeviceOpen(0);
+         auto xclbin = load_xclbin(dhdl, xclbinFilename);
+         auto top = reinterpret_cast<const axlf*>(xclbin.data());
+      }
+      
+      //If argc is 2 it runs design for finite iterations (Normal Flow)
+      //If argc is 3 and argv[2] is RUN_CODE ,it runs design for infinite iterations(To get POWER values)
+      if(argc==2 || (argc==3 && strcmp(argv[2],"RUN_CODE")==0)) {
+
+         const char* xclbinFilename = argv[1];
+         auto dhdl = xrtDeviceOpen(0);
+         auto xclbin = load_xclbin(dhdl, xclbinFilename);
+         auto top = reinterpret_cast<const axlf*>(xclbin.data());         
+
+         //////////////////////////////////////////
+         // Data-Mover IP Objects...
+         //////////////////////////////////////////
+   
+         datamover dmaHls[GEMM_INSTS];
+   
+         //////////////////////////////////////////
+         // GEMM Graph Objects...
+         //////////////////////////////////////////
+   
+         gemm_graph gemm_gr[GEMM_INSTS];
+   
+         //////////////////////////////////////////
+         // Initialising DataMover Units...
+         //////////////////////////////////////////
+   
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Initialising datamover %d...\n", i);
+            dmaHls[i].init(dhdl, top, i);
+         }
+   
+         //////////////////////////////////////////
+         // Initialising GEMM Graphs...
+         //////////////////////////////////////////
+   
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Initialising GEMM Graph %d...\n", i);
+            int ret = gemm_gr[i].init(dhdl, top, i);
+            
+            if (ret != 0)
+               return ret;
+         }
+   
+         auto t_linux_e2e_start = clock::now();
+
+         //////////////////////////////////////////
+         // Running GEMM Graphs...
+         //////////////////////////////////////////
+   
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Running GEMM Graph %d...\n", i);
+            int ret = gemm_gr[i].run();
+            
+            if (ret != 0)
+               return ret;
+         }
+   
+         auto t_linux_compute_start = clock::now();
+
+         //////////////////////////////////////////
+         // Running datamovers in each kernel for
+         // ITER_CNT times...
+         //////////////////////////////////////////
+   
+         DPRINTF("Running datamovers for %d Iterations...\n", ITER_CNT);
+   
+         //////////////////////////////////////////
+         // Running GeMM datamover IPs...
+         //////////////////////////////////////////
+   
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Running datamover %d...\n", i);
+            dmaHls[i].run();
+         }
+   
+         //////////////////////////////////////////
+         // Waiting for Datamover IPs
+         // to complete...
+         //////////////////////////////////////////
+         
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Waiting for datamover %d to complete...\n", i);
+            dmaHls[i].waitTo_complete();
+         }
+   
+         auto t_linux_end = clock::now();
+         linux_compute_ms = ms(t_linux_end - t_linux_compute_start);
+         linux_e2e_ms = ms(t_linux_end - t_linux_e2e_start);
+
+         //////////////////////////////////////////
+         // Comparing each gemm output with
+         // Golden...
+         //////////////////////////////////////////
+   
+         uint32_t errCnt = 0;
+         
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Checking Golden for GEMM Kernel %d...\n", i);
+            dmaHls[i].golden_check(&errCnt, i);
+         }
+   
+         /////////////////////////////////////////////////
+         // Clean up XRT, close device, pl-kernels
+         // and graph handles...
+         /////////////////////////////////////////////////
+   
+         //Closing PL-Handles
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Closing Datamover %d handles...\n", i);
+            dmaHls[i].close();
+         }
+   
+         //Closing Graphs
+         for(int i = 0; i < GEMM_INSTS; ++i)
+         {
+            DPRINTF("Closing GEMM Graph %d...\n", i);
+            gemm_gr[i].close();
+            DPRINTF("GEMM Graph %d end.\n",i);
+         }
+   
+         //Closing Device
+         xrtDeviceClose(dhdl);
+   
+         //Final Result
+         std::cout << "TEST " << (errCnt ? "FAILED" : "PASSED") << std::endl;
+         
+         printf("\nGEMM_INSTS = %d", GEMM_INSTS);
+         printf("\nITER_CNT   = %d\n", ITER_CNT);
+         
+         printf("\n================ AIE GEMM TIMING (Linux POV) ================\n");
+         printf("hw_compute_ms    (AIE hardware only)  : run vitis_analyzer on xrt.run_summary");
+         printf("linux_compute_ms (datamover run->done): %.3f ms\n", linux_compute_ms);
+         printf("linux_e2e_ms     (graph start->done)  : %.3f ms\n", linux_e2e_ms);
+         printf("=============================================================\n\n");
+
+         //Exit with result
+         return (errCnt ? EXIT_FAILURE :  EXIT_SUCCESS);
+      }
+   }
+}
+
